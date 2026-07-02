@@ -1,6 +1,8 @@
 import os
 import time
+import html
 import requests
+import xml.etree.ElementTree as ET
 from fastapi import FastAPI, Query
 
 app = FastAPI(title="Crypto News Strategy MVP")
@@ -11,14 +13,22 @@ NEWS_MIN_SCORE = int(os.getenv("NEWS_MIN_SCORE", "70"))
 
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 
+NEWS_FEEDS = [
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cryptoslate.com/feed/",
+]
+
 BULLISH_TERMS = [
     "approval", "approved", "etf", "inflow", "adoption", "institutional",
-    "blackrock", "listing", "partnership", "rate cut", "bullish", "surge"
+    "blackrock", "listing", "partnership", "rate cut", "bullish", "surge",
+    "record high", "all-time high", "accumulation", "buys bitcoin"
 ]
 
 BEARISH_TERMS = [
     "hack", "exploit", "lawsuit", "ban", "outflow", "delisting",
-    "crackdown", "collapse", "rate hike", "bearish", "sec charges"
+    "crackdown", "collapse", "rate hike", "bearish", "sec charges",
+    "liquidation", "selloff", "plunge", "fraud", "breach"
 ]
 
 
@@ -35,6 +45,16 @@ def normalize_symbol(symbol: str) -> str:
     if s.endswith("USD"):
         return s.replace("USD", "-USD")
     return symbol.upper()
+
+
+def infer_symbol_from_headline(headline: str) -> str:
+    text = headline.lower()
+
+    if "ethereum" in text or "ether" in text or " eth " in f" {text} ":
+        return "ETHUSDT"
+    if "solana" in text or " sol " in f" {text} ":
+        return "SOLUSDT"
+    return "BTCUSDT"
 
 
 def send_telegram(message: str) -> bool:
@@ -80,15 +100,65 @@ def score_news(headline: str) -> dict:
     }
 
 
+def fetch_rss_headlines(limit: int = 15) -> list[dict]:
+    items = []
+    seen = set()
+
+    for feed_url in NEWS_FEEDS:
+        try:
+            response = requests.get(
+                feed_url,
+                headers={"User-Agent": "crypto-news-strategy/1.0"},
+                timeout=15
+            )
+            response.raise_for_status()
+
+            root = ET.fromstring(response.content)
+            channel_items = root.findall(".//item")
+
+            for item in channel_items:
+                title_el = item.find("title")
+                link_el = item.find("link")
+                pub_el = item.find("pubDate")
+
+                if title_el is None or not title_el.text:
+                    continue
+
+                title = html.unescape(title_el.text.strip())
+                if title.lower() in seen:
+                    continue
+
+                seen.add(title.lower())
+
+                items.append({
+                    "title": title,
+                    "link": link_el.text.strip() if link_el is not None and link_el.text else "",
+                    "published": pub_el.text.strip() if pub_el is not None and pub_el.text else "",
+                    "source": feed_url
+                })
+
+                if len(items) >= limit:
+                    return items
+
+        except Exception as e:
+            items.append({
+                "title": f"FEED_ERROR: {feed_url}",
+                "link": "",
+                "published": "",
+                "source": str(e)
+            })
+
+    return items[:limit]
+
+
 def get_klines(symbol: str, granularity: int = 900) -> list[dict]:
     product_id = normalize_symbol(symbol)
     url = COINBASE_CANDLES_URL.format(product_id=product_id)
-    headers = {"User-Agent": "crypto-news-strategy/1.0"}
 
     response = requests.get(
         url,
         params={"granularity": granularity},
-        headers=headers,
+        headers={"User-Agent": "crypto-news-strategy/1.0"},
         timeout=15
     )
     response.raise_for_status()
@@ -97,7 +167,6 @@ def get_klines(symbol: str, granularity: int = 900) -> list[dict]:
     if not isinstance(raw, list) or len(raw) < 30:
         raise RuntimeError(f"Coinbase returned invalid candles for {product_id}: {raw}")
 
-    # Coinbase format: [time, low, high, open, close, volume]
     raw = sorted(raw, key=lambda x: x[0])[-100:]
 
     candles = []
@@ -188,7 +257,7 @@ def format_signal(result: dict) -> str:
 <b>Reason:</b> {result['reason']}
 
 <b>News:</b>
-{result['news']['headline']}
+{html.escape(result['news']['headline'])}
 
 <b>News sentiment:</b> {result['news']['sentiment']}
 <b>News score:</b> {result['news']['score']}/100
@@ -227,6 +296,15 @@ def market_test(symbol: str = Query("BTCUSDT")):
     }
 
 
+@app.get("/news-test")
+def news_test(limit: int = Query(10)):
+    headlines = fetch_rss_headlines(limit=limit)
+    return {
+        "count": len(headlines),
+        "headlines": headlines
+    }
+
+
 @app.get("/run-check")
 def run_check(
     symbol: str = Query("BTCUSDT"),
@@ -244,3 +322,50 @@ def run_check(
             "symbol": symbol,
             "headline": headline
         }
+
+
+@app.get("/live-news-check")
+def live_news_check(limit: int = Query(10), send_waits: bool = Query(False)):
+    headlines = fetch_rss_headlines(limit=limit)
+    results = []
+    sent_count = 0
+
+    for item in headlines:
+        title = item["title"]
+
+        if title.startswith("FEED_ERROR"):
+            results.append({
+                "status": "feed_error",
+                "item": item
+            })
+            continue
+
+        symbol = infer_symbol_from_headline(title)
+
+        try:
+            result = evaluate_signal(symbol=symbol, headline=title)
+            result["source_link"] = item.get("link", "")
+            result["published"] = item.get("published", "")
+
+            should_send = result["action"] in ["BUY", "SELL"] or (
+                send_waits and result["news"]["score"] >= NEWS_MIN_SCORE
+            )
+
+            if should_send:
+                send_telegram(format_signal(result))
+                sent_count += 1
+
+            results.append(result)
+
+        except Exception as e:
+            results.append({
+                "status": "error",
+                "headline": title,
+                "error": str(e)
+            })
+
+    return {
+        "checked": len(results),
+        "sent": sent_count,
+        "results": results
+    }
