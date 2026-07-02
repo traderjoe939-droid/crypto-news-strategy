@@ -1,35 +1,16 @@
-# Crypto News Strategy One-File MVP
+# Crypto News Strategy Worker
 
-## Files
-- `app.py`
-- `requirements.txt`
-
-## Render settings
-
-Build Command:
-```bash
-pip install -r requirements.txt
-```
-
-Start Command:
-```bash
+Web Service start command:
 uvicorn app:app --host 0.0.0.0 --port $PORT
-```
 
-## Render Environment Variables
+Background Worker start command:
+python app.py
 
-```text
-TELEGRAM_BOT_TOKEN=your_new_token
-TELEGRAM_CHAT_ID=-5306251294
+Environment variables:
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
 NEWS_MIN_SCORE=70
-```
-
-## Test URLs
-
-```text
-/
- /health
-/test-telegram
-/run-check
-/run-check?symbol=BTCUSDT&headline=Bitcoin ETF approval sparks institutional adoption
-```
+RISK_PER_TRADE=400
+CONTRACT_SIZE_BTC=1
+POLL_SECONDS=30
+SEND_WAITS=false
