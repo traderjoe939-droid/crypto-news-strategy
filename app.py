@@ -10,6 +10,8 @@ app = FastAPI(title="Crypto News Strategy MVP")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 NEWS_MIN_SCORE = int(os.getenv("NEWS_MIN_SCORE", "70"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "400"))
+CONTRACT_SIZE_BTC = float(os.getenv("CONTRACT_SIZE_BTC", "1"))
 
 COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 
@@ -49,7 +51,6 @@ def normalize_symbol(symbol: str) -> str:
 
 def infer_symbol_from_headline(headline: str) -> str:
     text = headline.lower()
-
     if "ethereum" in text or "ether" in text or " eth " in f" {text} ":
         return "ETHUSDT"
     if "solana" in text or " sol " in f" {text} ":
@@ -92,12 +93,7 @@ def score_news(headline: str) -> dict:
         score = 20
         hits = bullish_hits + bearish_hits
 
-    return {
-        "headline": headline,
-        "sentiment": sentiment,
-        "score": score,
-        "matched_terms": hits
-    }
+    return {"headline": headline, "sentiment": sentiment, "score": score, "matched_terms": hits}
 
 
 def fetch_rss_headlines(limit: int = 15) -> list[dict]:
@@ -106,28 +102,20 @@ def fetch_rss_headlines(limit: int = 15) -> list[dict]:
 
     for feed_url in NEWS_FEEDS:
         try:
-            response = requests.get(
-                feed_url,
-                headers={"User-Agent": "crypto-news-strategy/1.0"},
-                timeout=15
-            )
+            response = requests.get(feed_url, headers={"User-Agent": "crypto-news-strategy/1.0"}, timeout=15)
             response.raise_for_status()
-
             root = ET.fromstring(response.content)
-            channel_items = root.findall(".//item")
 
-            for item in channel_items:
+            for item in root.findall(".//item"):
                 title_el = item.find("title")
                 link_el = item.find("link")
                 pub_el = item.find("pubDate")
-
                 if title_el is None or not title_el.text:
                     continue
 
                 title = html.unescape(title_el.text.strip())
                 if title.lower() in seen:
                     continue
-
                 seen.add(title.lower())
 
                 items.append({
@@ -139,14 +127,8 @@ def fetch_rss_headlines(limit: int = 15) -> list[dict]:
 
                 if len(items) >= limit:
                     return items
-
         except Exception as e:
-            items.append({
-                "title": f"FEED_ERROR: {feed_url}",
-                "link": "",
-                "published": "",
-                "source": str(e)
-            })
+            items.append({"title": f"FEED_ERROR: {feed_url}", "link": "", "published": "", "source": str(e)})
 
     return items[:limit]
 
@@ -168,19 +150,14 @@ def get_klines(symbol: str, granularity: int = 900) -> list[dict]:
         raise RuntimeError(f"Coinbase returned invalid candles for {product_id}: {raw}")
 
     raw = sorted(raw, key=lambda x: x[0])[-100:]
-
-    candles = []
-    for item in raw:
-        candles.append({
-            "open_time": int(item[0]),
-            "low": float(item[1]),
-            "high": float(item[2]),
-            "open": float(item[3]),
-            "close": float(item[4]),
-            "volume": float(item[5])
-        })
-
-    return candles
+    return [{
+        "open_time": int(i[0]),
+        "low": float(i[1]),
+        "high": float(i[2]),
+        "open": float(i[3]),
+        "close": float(i[4]),
+        "volume": float(i[5])
+    } for i in raw]
 
 
 def analyze_price_action(candles: list[dict]) -> dict:
@@ -216,6 +193,49 @@ def analyze_price_action(candles: list[dict]) -> dict:
     }
 
 
+def calculate_trade_plan(action: str, price: dict) -> dict:
+    entry = float(price["close"])
+
+    if action == "BUY":
+        stop_loss = float(price["previous_low"])
+        risk_distance = entry - stop_loss
+        tp1 = entry + risk_distance
+        tp2 = entry + (risk_distance * 2)
+    elif action == "SELL":
+        stop_loss = float(price["previous_high"])
+        risk_distance = stop_loss - entry
+        tp1 = entry - risk_distance
+        tp2 = entry - (risk_distance * 2)
+    else:
+        return {
+            "entry": entry,
+            "stop_loss": None,
+            "tp1": None,
+            "tp2": None,
+            "risk_usd": RISK_PER_TRADE,
+            "lot_size": None,
+            "risk_reward_tp1": None,
+            "risk_reward_tp2": None
+        }
+
+    if risk_distance <= 0:
+        lot_size = None
+    else:
+        lot_size = RISK_PER_TRADE / risk_distance / CONTRACT_SIZE_BTC
+
+    return {
+        "entry": round(entry, 2),
+        "stop_loss": round(stop_loss, 2),
+        "tp1": round(tp1, 2),
+        "tp2": round(tp2, 2),
+        "risk_distance": round(risk_distance, 2),
+        "risk_usd": RISK_PER_TRADE,
+        "lot_size": round(lot_size, 4) if lot_size else None,
+        "risk_reward_tp1": "1:1",
+        "risk_reward_tp2": "1:2"
+    }
+
+
 def evaluate_signal(symbol: str, headline: str) -> dict:
     news = score_news(headline)
     candles = get_klines(symbol)
@@ -238,6 +258,8 @@ def evaluate_signal(symbol: str, headline: str) -> dict:
             confidence = 85
             reason = "Bearish news confirmed by breakdown and volume."
 
+    trade = calculate_trade_plan(action, price)
+
     return {
         "symbol": symbol.upper(),
         "data_symbol": normalize_symbol(symbol),
@@ -246,16 +268,32 @@ def evaluate_signal(symbol: str, headline: str) -> dict:
         "reason": reason,
         "news": news,
         "price": price,
+        "trade": trade,
         "timestamp": int(time.time())
     }
 
 
 def format_signal(result: dict) -> str:
+    trade = result["trade"]
+
+    trade_block = ""
+    if result["action"] in ["BUY", "SELL"]:
+        trade_block = f"""
+<b>Entry:</b> {trade['entry']}
+<b>Stop Loss:</b> {trade['stop_loss']}
+<b>TP1:</b> {trade['tp1']}
+<b>TP2:</b> {trade['tp2']}
+
+<b>Risk:</b> ${trade['risk_usd']}
+<b>MT5 Lot Size:</b> {trade['lot_size']}
+<b>RR:</b> TP1 {trade['risk_reward_tp1']} / TP2 {trade['risk_reward_tp2']}
+"""
+
     return f"""🚨 <b>{result['action']} / {result['symbol']}</b>
 
 <b>Confidence:</b> {result['confidence']}%
 <b>Reason:</b> {result['reason']}
-
+{trade_block}
 <b>News:</b>
 {html.escape(result['news']['headline'])}
 
@@ -280,29 +318,20 @@ def health():
 
 @app.get("/test-telegram")
 def test_telegram():
-    message = "🚨 TEST SIGNAL\nCrypto news strategy is connected."
-    sent = send_telegram(message)
-    return {"sent": sent}
+    return {"sent": send_telegram("🚨 TEST SIGNAL\nCrypto news strategy is connected.")}
 
 
 @app.get("/market-test")
 def market_test(symbol: str = Query("BTCUSDT")):
     candles = get_klines(symbol)
-    return {
-        "symbol": symbol,
-        "data_symbol": normalize_symbol(symbol),
-        "candles": len(candles),
-        "last_close": candles[-1]["close"]
-    }
+    price = analyze_price_action(candles)
+    return {"symbol": symbol, "data_symbol": normalize_symbol(symbol), "candles": len(candles), "price": price}
 
 
 @app.get("/news-test")
 def news_test(limit: int = Query(10)):
     headlines = fetch_rss_headlines(limit=limit)
-    return {
-        "count": len(headlines),
-        "headlines": headlines
-    }
+    return {"count": len(headlines), "headlines": headlines}
 
 
 @app.get("/run-check")
@@ -312,16 +341,10 @@ def run_check(
 ):
     try:
         result = evaluate_signal(symbol=symbol, headline=headline)
-        message = format_signal(result)
-        send_telegram(message)
+        send_telegram(format_signal(result))
         return result
     except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "symbol": symbol,
-            "headline": headline
-        }
+        return {"status": "error", "error": str(e), "symbol": symbol, "headline": headline}
 
 
 @app.get("/live-news-check")
@@ -332,12 +355,8 @@ def live_news_check(limit: int = Query(10), send_waits: bool = Query(False)):
 
     for item in headlines:
         title = item["title"]
-
         if title.startswith("FEED_ERROR"):
-            results.append({
-                "status": "feed_error",
-                "item": item
-            })
+            results.append({"status": "feed_error", "item": item})
             continue
 
         symbol = infer_symbol_from_headline(title)
@@ -356,16 +375,7 @@ def live_news_check(limit: int = Query(10), send_waits: bool = Query(False)):
                 sent_count += 1
 
             results.append(result)
-
         except Exception as e:
-            results.append({
-                "status": "error",
-                "headline": title,
-                "error": str(e)
-            })
+            results.append({"status": "error", "headline": title, "error": str(e)})
 
-    return {
-        "checked": len(results),
-        "sent": sent_count,
-        "results": results
-    }
+    return {"checked": len(results), "sent": sent_count, "results": results}
