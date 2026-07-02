@@ -9,7 +9,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 NEWS_MIN_SCORE = int(os.getenv("NEWS_MIN_SCORE", "70"))
 
-BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
+COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/{product_id}/candles"
 
 BULLISH_TERMS = [
     "approval", "approved", "etf", "inflow", "adoption", "institutional",
@@ -20,6 +20,21 @@ BEARISH_TERMS = [
     "hack", "exploit", "lawsuit", "ban", "outflow", "delisting",
     "crackdown", "collapse", "rate hike", "bearish", "sec charges"
 ]
+
+
+def normalize_symbol(symbol: str) -> str:
+    s = symbol.upper().replace("-", "")
+    if s in ["BTCUSDT", "BTCUSD"]:
+        return "BTC-USD"
+    if s in ["ETHUSDT", "ETHUSD"]:
+        return "ETH-USD"
+    if s in ["SOLUSDT", "SOLUSD"]:
+        return "SOL-USD"
+    if s.endswith("USDT"):
+        return s.replace("USDT", "-USD")
+    if s.endswith("USD"):
+        return s.replace("USD", "-USD")
+    return symbol.upper()
 
 
 def send_telegram(message: str) -> bool:
@@ -65,31 +80,33 @@ def score_news(headline: str) -> dict:
     }
 
 
-def get_klines(symbol: str, interval: str = "15", limit: int = 100) -> list[dict]:
-    params = {
-        "category": "linear",
-        "symbol": symbol.upper(),
-        "interval": interval,
-        "limit": limit
-    }
+def get_klines(symbol: str, granularity: int = 900) -> list[dict]:
+    product_id = normalize_symbol(symbol)
+    url = COINBASE_CANDLES_URL.format(product_id=product_id)
+    headers = {"User-Agent": "crypto-news-strategy/1.0"}
 
-    response = requests.get(BYBIT_KLINES_URL, params=params, timeout=15)
+    response = requests.get(
+        url,
+        params={"granularity": granularity},
+        headers=headers,
+        timeout=15
+    )
     response.raise_for_status()
-    data = response.json()
 
-    if data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit error: {data}")
+    raw = response.json()
+    if not isinstance(raw, list) or len(raw) < 30:
+        raise RuntimeError(f"Coinbase returned invalid candles for {product_id}: {raw}")
 
-    raw_candles = data["result"]["list"]
-    raw_candles = list(reversed(raw_candles))
+    # Coinbase format: [time, low, high, open, close, volume]
+    raw = sorted(raw, key=lambda x: x[0])[-100:]
 
     candles = []
-    for item in raw_candles:
+    for item in raw:
         candles.append({
             "open_time": int(item[0]),
-            "open": float(item[1]),
+            "low": float(item[1]),
             "high": float(item[2]),
-            "low": float(item[3]),
+            "open": float(item[3]),
             "close": float(item[4]),
             "volume": float(item[5])
         })
@@ -124,7 +141,7 @@ def analyze_price_action(candles: list[dict]) -> dict:
         "close": close,
         "previous_high": previous_high,
         "previous_low": previous_low,
-        "volume": volume,
+        "volume": round(volume, 4),
         "average_volume": round(average_volume, 4),
         "volume_ratio": round(volume_ratio, 2)
     }
@@ -154,6 +171,7 @@ def evaluate_signal(symbol: str, headline: str) -> dict:
 
     return {
         "symbol": symbol.upper(),
+        "data_symbol": normalize_symbol(symbol),
         "action": action,
         "confidence": confidence,
         "reason": reason,
@@ -196,6 +214,17 @@ def test_telegram():
     message = "🚨 TEST SIGNAL\nCrypto news strategy is connected."
     sent = send_telegram(message)
     return {"sent": sent}
+
+
+@app.get("/market-test")
+def market_test(symbol: str = Query("BTCUSDT")):
+    candles = get_klines(symbol)
+    return {
+        "symbol": symbol,
+        "data_symbol": normalize_symbol(symbol),
+        "candles": len(candles),
+        "last_close": candles[-1]["close"]
+    }
 
 
 @app.get("/run-check")
