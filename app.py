@@ -3,13 +3,13 @@ import time
 import requests
 from fastapi import FastAPI, Query
 
-app = FastAPI(title="Crypto News Strategy One-File MVP")
+app = FastAPI(title="Crypto News Strategy MVP")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 NEWS_MIN_SCORE = int(os.getenv("NEWS_MIN_SCORE", "70"))
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BYBIT_KLINES_URL = "https://api.bybit.com/v5/market/kline"
 
 BULLISH_TERMS = [
     "approval", "approved", "etf", "inflow", "adoption", "institutional",
@@ -41,7 +41,6 @@ def send_telegram(message: str) -> bool:
 
 def score_news(headline: str) -> dict:
     text = headline.lower()
-
     bullish_hits = [term for term in BULLISH_TERMS if term in text]
     bearish_hits = [term for term in BEARISH_TERMS if term in text]
 
@@ -66,35 +65,39 @@ def score_news(headline: str) -> dict:
     }
 
 
-def get_klines(symbol: str, interval: str = "15m", limit: int = 100) -> list[dict]:
+def get_klines(symbol: str, interval: str = "15", limit: int = 100) -> list[dict]:
     params = {
+        "category": "linear",
         "symbol": symbol.upper(),
         "interval": interval,
         "limit": limit
     }
 
-    response = requests.get(BINANCE_KLINES_URL, params=params, timeout=15)
+    response = requests.get(BYBIT_KLINES_URL, params=params, timeout=15)
     response.raise_for_status()
+    data = response.json()
+
+    if data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit error: {data}")
+
+    raw_candles = data["result"]["list"]
+    raw_candles = list(reversed(raw_candles))
 
     candles = []
-    for item in response.json():
+    for item in raw_candles:
         candles.append({
-            "open_time": item[0],
+            "open_time": int(item[0]),
             "open": float(item[1]),
             "high": float(item[2]),
             "low": float(item[3]),
             "close": float(item[4]),
-            "volume": float(item[5]),
-            "close_time": item[6]
+            "volume": float(item[5])
         })
 
     return candles
 
 
 def analyze_price_action(candles: list[dict]) -> dict:
-    if len(candles) < 30:
-        raise ValueError("Need at least 30 candles")
-
     last = candles[-1]
     lookback = candles[-21:-1]
 
@@ -144,7 +147,6 @@ def evaluate_signal(symbol: str, headline: str) -> dict:
             action = "BUY"
             confidence = 85
             reason = "Bullish news confirmed by breakout and volume."
-
         elif news["sentiment"] == "BEARISH" and price["bias"] == "BEARISH":
             action = "SELL"
             confidence = 85
@@ -201,10 +203,15 @@ def run_check(
     symbol: str = Query("BTCUSDT"),
     headline: str = Query("Bitcoin ETF approval sparks institutional adoption")
 ):
-    result = evaluate_signal(symbol=symbol, headline=headline)
-    message = format_signal(result)
-
-    # MVP: send every result so we can verify Telegram + logic.
-    send_telegram(message)
-
-    return result
+    try:
+        result = evaluate_signal(symbol=symbol, headline=headline)
+        message = format_signal(result)
+        send_telegram(message)
+        return result
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "symbol": symbol,
+            "headline": headline
+        }
